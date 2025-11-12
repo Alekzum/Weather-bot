@@ -2,8 +2,9 @@ import time
 import httpx
 import asyncio
 import hashlib
-from aiogram import types, Router, Bot
+from aiogram import types, Router, Bot, F
 from aiogram.enums import ParseMode
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from utils.weather_utils import get_current_weather_async, get_location_async
 from utils.image_utils import create_weather_card_async
 from utils.file_utils import (
@@ -21,8 +22,12 @@ rt = Router(name=__name__)
 logger = get_logger(__name__)
 
 
-@rt.inline_query()
-async def inline_weather_query(query: types.InlineQuery, bot: Bot):
+@rt.inline_query(
+    F.func(lambda i: i.query and i.query.strip().lower() or "").as_("location")
+)
+async def inline_weather_query(
+    query: types.InlineQuery, bot: Bot, location: str
+):
     """Асинхронный обработчик инлайн запросов погоды"""
     logger.debug(
         "Пришёл инлайн-запрос",
@@ -36,8 +41,6 @@ async def inline_weather_query(query: types.InlineQuery, bot: Bot):
     if bot_username is None:
         raise RuntimeError("Почему у бота нет псевдонима?")  # just for IDE :(
 
-    location = query.query.strip().lower()
-
     if not location:
         results = generate_article(
             id="help",
@@ -45,11 +48,13 @@ async def inline_weather_query(query: types.InlineQuery, bot: Bot):
             description=f"Введите @{bot_username} локация",
             message_text=HELP_MESSAGE.format(bot_username=bot_username),
         )
-        await query.answer(results, cache_time=3600)  # type: ignore[arg-type]
+        await query.answer(results, cache_time=30)  # type: ignore[arg-type]
         return
 
     try:
-        return await _inline_weather_query(query, bot)
+        await _inline_weather_query(
+            query=query, bot_username=bot_username, location=location
+        )
 
     except Exception as ex:
         logger.error(
@@ -66,24 +71,103 @@ async def inline_weather_query(query: types.InlineQuery, bot: Bot):
         await query.answer(results, cache_time=1)  # type: ignore[arg-type]
 
 
-async def _inline_weather_query(query: types.InlineQuery, bot: Bot):
-    bot_me = await bot.get_me()
-    bot_username = bot_me.username
-    if bot_username is None:
-        raise RuntimeError("Почему у бота нет псевдонима?")  # just for IDE :(
+@rt.chosen_inline_result(
+    F.result_id.split(":")[0] == "gw",
+    F.result_id.split(":")[1].as_("country_code_"),
+    F.result_id.split(":")[2].as_("city"),
+)
+async def chosen_inline_weather_result(
+    cir: types.ChosenInlineResult,
+    bot: Bot,
+    country_code_: str,
+    city: str,
+):
+    country_code = country_code_ if country_code_ != "." else None
+    logger.debug(
+        "Getting weather from CIR", city=city, country_code=country_code
+    )
+    start_time = time.time()
+    query = cir.query
 
+    weather_data = await get_current_weather_async(city, country_code)
+    if not weather_data:
+        logger.warn(
+            "Не удалось получить погоду",
+            city=city,
+            country_code=country_code,
+        )
+        await bot.edit_message_caption(
+            inline_message_id=cir.inline_message_id,
+            caption="Не удалось получить погоду",
+        )
+        return
+
+    image_url = await generate_image(weather_data=weather_data)
+
+    if query.strip().lower() == "random":
+        title = f"Случайная погода в {weather_data['city']}"
+        description = f"Случайный IP | {weather_data['temp']:+.1f}°C, {weather_data['description']}"
+    else:
+        title = f"Погода в {weather_data['city']}"
+        description = (
+            f"{weather_data['temp']:+.1f}°C, {weather_data['description']}"
+        )
+
+    await bot.edit_message_media(
+        inline_message_id=cir.inline_message_id,
+        media=types.InputMediaPhoto(media=image_url),
+    )
+    await bot.edit_message_caption(
+        inline_message_id=cir.inline_message_id,
+        caption=title + "\n" + description,
+    )
+
+    elapsed_time = time.time() - start_time
+    if query.strip().lower() == "random":
+        logger.info(
+            "Случайная погода обработана.",
+            elapsed_time=elapsed_time,
+            city=weather_data["city"],
+            country=weather_data["country"],
+            temperature=weather_data["temp"],
+            city_type="random",
+        )
+    else:
+        logger.info(
+            "Запрос обработан",
+            elapsed_time=elapsed_time,
+            city=weather_data["city"],
+            country=weather_data.get("country"),
+            temperature=weather_data["temp"],
+            city_type="specified",
+        )
+    pass
+
+
+@rt.chosen_inline_result(
+    F.result_id.split(":")[0] == "gw",
+)
+async def chosen_inline_weather_skip(
+    cir: types.ChosenInlineResult,
+):
+    logger.warn("Skipped CIR with gw", result_id=cir.result_id)
+
+
+async def _inline_weather_query(
+    query: types.InlineQuery, bot_username: str, location: str
+):
     # Обработка команды random
     start_time = time.time()
-    location = query.query.strip().lower()
-    is_ip = location.count(".") == 4
+    user_query = query.query.strip().lower()
+    is_ip = user_query.count(".") == 4
     city = country_code = None
 
-    if location == "random":
+    if user_query == "random":
         i = 0
         while i < 3:
             random_ip = generate_random_ip()
             logger.debug(
-                f"{'Повторно с' if i == 0 else 'С'}генерирован случайный IP",
+                f"{'Повторно с' if i != 0 else 'С'}генерирован случайный IP",
                 random_ip=random_ip,
             )
             city, country_code = await get_location_async(random_ip)
@@ -108,85 +192,73 @@ async def _inline_weather_query(query: types.InlineQuery, bot: Bot):
             )
             return
 
-        location = random_ip
-    elif is_ip:
-        city, country_code = await get_location_async(location)
+        user_query = random_ip
+        is_ip = True
 
-    if not city:
-        results = generate_article(
-            id="ip_error",
-            title="Ошибка определения местоположения",
-            description=f"IP {location} не найден",
-            message_text=(
-                "❌ IP <code>{}</code> не найден\n\n"
-                "Проверьте IP адрес и повторите попытку\n\n<b>@{}</b>"
-            ).format(location, bot_username),
-        )
-        await query.answer(results, cache_time=1)  # type: ignore[arg-type]
-        elapsed_time = time.time() - start_time
-        logger.warn("Ошибка IP отправлена", elapsed_time=elapsed_time)
-        return
+    if is_ip:
+        city, country_code = await get_location_async(user_query)
 
-    weather_data = await get_current_weather_async(city, country_code)
-    if not weather_data:
-        return
+        if not city:
+            results = generate_article(
+                id="ip_error",
+                title="Ошибка определения местоположения",
+                description=f"IP {user_query} не найден",
+                message_text=(
+                    "❌ IP <code>{}</code> не найден\n\n"
+                    "Проверьте IP адрес и повторите попытку\n\n<b>@{}</b>"
+                ).format(user_query, bot_username),
+            )
+            await query.answer(results, cache_time=1)  # type: ignore[arg-type]
+            elapsed_time = time.time() - start_time
+            logger.warn("Ошибка IP отправлена", elapsed_time=elapsed_time)
+            return
 
-    image_url, website_filename = await generate_image(
-        weather_data=weather_data
-    )
-
-    if query.query.strip().lower() == "random":
-        title = f"Случайная погода в {weather_data['city']}"
-        description = f"Случайный IP | {weather_data['temp']:+.1f}°C, {weather_data['description']}"
     else:
-        title = f"Погода в {weather_data['city']}"
-        description = (
-            f"{weather_data['temp']:+.1f}°C, {weather_data['description']}"
-        )
+        city = user_query
 
-    result_id = generate_result_id(weather_data["city"], int(time.time()))
+    result_id = ":".join(
+        (
+            "gw",
+            country_code if country_code is not None else ".",
+            city,
+            # generate_result_id(
+            #     city,
+            #     int(time.time()),
+            # ),
+        )
+    )
     results = [
         types.InlineQueryResultPhoto(
             id=result_id,
-            photo_url=image_url,
-            thumbnail_url=image_url,
-            title=title,
-            description=description,
-            caption="<code>{} - {:+.1f}°C, {}</code>".format(
-                weather_data["city"],
-                weather_data["temp"],
-                weather_data["description"],
-            ),
+            thumbnail_url="https://chuhan.lol/icon.jpg",
+            photo_url="https://chuhan.lol/icon.jpg",
+            title=f'Запросить погоду для "{city}"',
+            description="При выборе бот начнёт получать погоду для города, затем обновит сообщение",
+            caption=f'Загрузка погоды для "{city}"',
             parse_mode=ParseMode.HTML,
             photo_width=1600,
             photo_height=1000,
+            reply_markup=InlineKeyboardBuilder()
+            .button(text="...", callback_data="unhandled")
+            .as_markup(),
         )
     ]
 
+    elapsed_time = time.time() - start_time
+    logger.debug(
+        "Обрабатывается первичный запрос на погоду...",
+        elapsed_time=elapsed_time,
+        result_id=result_id,
+    )
     await query.answer(results, cache_time=3)  # type: ignore[arg-type]
 
     elapsed_time = time.time() - start_time
-    if query.query.strip().lower() == "random":
-        logger.info(
-            "Случайная погода обработана.",
-            elapsed_time=elapsed_time,
-            city=weather_data["city"],
-            country=weather_data["country"],
-            temperature=weather_data["temp"],
-            city_type="random",
-        )
-    else:
-        logger.info(
-            "Запрос обработан",
-            elapsed_time=elapsed_time,
-            city=weather_data["city"],
-            country=weather_data.get("country"),
-            temperature=weather_data["temp"],
-            city_type="specified",
-        )
-
-    # Удаляем файлы
-    cleanup_files(website_filename)
+    logger.debug(
+        "Обработан первичный запрос на погоду...",
+        elapsed_time=elapsed_time,
+        result_id=result_id,
+    )
+    return
 
 
 def generate_result_id(city: str, timestamp: float):
@@ -257,13 +329,14 @@ async def generate_image(weather_data: dict):
         raise RuntimeError("Didn't created card's BytesIO!")
 
     imgbb_task = asyncio.create_task(upload_to_imgbb(card_io))
-    upload_to_website(card_io, website_filename)
+    await upload_to_website(card_io, website_filename)
 
     image_url = await imgbb_task
 
     if not image_url:
         image_url = f"https://chuhan.lol/{website_filename}"
-    return image_url, website_filename
+    cleanup_files(website_filename)
+    return image_url
 
 
 HELP_MESSAGE = (
